@@ -1,0 +1,475 @@
+name: Private PR CI
+on:
+  push:
+    branches:
+      - "**/**"
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Commit SHA (40 hexadecimal characters)
+        required: false
+        type: string
+      pr_number:
+        description: Private repository PR number
+        required: false
+        type: string
+      branch:
+        description: Private repository branch name (defaults to main)
+        required: false
+        type: string
+permissions: {}
+concurrency:
+  group: private-ci-${{ github.event_name == 'push' && github.ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      repository: ${{ steps.resolve.outputs.repository }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+    steps:
+      - name: Resolve and validate private repository revision
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          ALLOWED_REPOSITORY: ${{ vars.PRIVATE_REPOSITORY }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BRANCH: ${{ github.ref_name }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_BRANCH: ${{ inputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ALLOWED_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          repository="$ALLOWED_REPOSITORY"
+          pr_number=''
+          if [[ "$EVENT_NAME" == push ]]; then
+            repo_name="${repository#*/}"
+            prefix="$repo_name/"
+            if [[ "$PUSH_BRANCH" != "$prefix"* || "$PUSH_BRANCH" == "$prefix" ]]; then
+              echo '::error::Public branch must start with the configured private repository name followed by /.'
+              exit 1
+            fi
+            target="${PUSH_BRANCH#"$prefix"}"
+            if [[ "$target" == pr/* ]]; then
+              pr_number="${target#pr/}"
+              [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]
+              sha=$(gh api "repos/$repository/pulls/$pr_number" --jq '.head.sha')
+            else
+              encoded_branch=$(jq -nr --arg branch "$target" '$branch | @uri')
+              sha=$(gh api "repos/$repository/branches/$encoded_branch" --jq '.commit.sha')
+            fi
+          else
+            count=0
+            [[ -z "$INPUT_COMMIT" ]] || count=$((count + 1))
+            [[ -z "$INPUT_PR_NUMBER" ]] || count=$((count + 1))
+            [[ -z "$INPUT_BRANCH" ]] || count=$((count + 1))
+            if (( count > 1 )); then
+              echo '::error::Specify only one of commit, PR number, or branch.'
+              exit 1
+            fi
+            if [[ -n "$INPUT_PR_NUMBER" ]]; then
+              [[ "$INPUT_PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+              pr_number="$INPUT_PR_NUMBER"
+              sha=$(gh api "repos/$repository/pulls/$pr_number" --jq '.head.sha')
+            elif [[ -n "$INPUT_COMMIT" ]]; then
+              [[ "$INPUT_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]
+              sha="${INPUT_COMMIT,,}"
+            else
+              branch="${INPUT_BRANCH:-main}"
+              encoded_branch=$(jq -nr --arg branch "$branch" '$branch | @uri')
+              sha=$(gh api "repos/$repository/branches/$encoded_branch" --jq '.commit.sha')
+            fi
+          fi
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          printf 'repository=%s\nsha=%s\npr_number=%s\n' "$repository" "$sha" "$pr_number" >> "$GITHUB_OUTPUT"
+  backend:
+    name: Backend / Test and build
+    needs: [validate]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
+      MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
+      MAVEN_RELEASE_REPOSITORY_URL: ${{ secrets.MAVEN_RELEASE_REPOSITORY_URL }}
+      MAVEN_SNAPSHOT_REPOSITORY_URL: ${{ secrets.MAVEN_SNAPSHOT_REPOSITORY_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+      - name: Configure local Gradle build cache
+        run: bash ./scripts/ci/build-cache.sh setup-gradle
+      - name: Require private Maven secrets
+        shell: bash
+        run: |
+          for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+      - name: Run business tests and package
+        working-directory: mine-query
+        run: ./gradlew --no-daemon --build-cache checkstyleMain checkstyleTest test bootJar
+      - name: Save backend bootJar to build cache
+        run: bash ./scripts/ci/build-cache.sh save-backend-jar
+      - name: Upload backend-test-reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-reports
+          path: |
+            mine-query/build/reports/tests/test
+            mine-query/build/test-results/test
+          if-no-files-found: warn
+  backend-infrastructure:
+    name: Backend / Infrastructure integration
+    needs: [validate]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
+      MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
+      MAVEN_RELEASE_REPOSITORY_URL: ${{ secrets.MAVEN_RELEASE_REPOSITORY_URL }}
+      MAVEN_SNAPSHOT_REPOSITORY_URL: ${{ secrets.MAVEN_SNAPSHOT_REPOSITORY_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+      - name: Configure local Gradle build cache
+        run: bash ./scripts/ci/build-cache.sh setup-gradle
+      - name: Require private Maven secrets
+        shell: bash
+        run: |
+          for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+      - name: Run PostgreSQL and Redis integration tests
+        working-directory: mine-query
+        run: ./gradlew --no-daemon --build-cache infrastructureTest
+      - name: Upload backend-infrastructure-test-reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-infrastructure-test-reports
+          path: |
+            mine-query/build/reports/tests/infrastructureTest
+            mine-query/build/test-results/infrastructureTest
+          if-no-files-found: warn
+  api-contract:
+    name: API / OpenAPI compatibility
+    needs: [validate]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
+      MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
+      MAVEN_RELEASE_REPOSITORY_URL: ${{ secrets.MAVEN_RELEASE_REPOSITORY_URL }}
+      MAVEN_SNAPSHOT_REPOSITORY_URL: ${{ secrets.MAVEN_SNAPSHOT_REPOSITORY_URL }}
+      NEXT_TELEMETRY_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+      - name: Configure local Gradle build cache
+        run: bash ./scripts/ci/build-cache.sh setup-gradle
+      - name: Require private Maven secrets
+        shell: bash
+        run: |
+          for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+      - name: Publish and validate backend OpenAPI
+        working-directory: mine-query
+        run: ./gradlew --no-daemon --build-cache contractTest
+      - name: Upload backend-api-contract
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-api-contract
+          path: |
+            mine-query/build/openapi/mine-query-openapi.json
+            mine-query/build/reports/tests/contractTest
+            mine-query/build/test-results/contractTest
+          if-no-files-found: warn
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9.15.1'
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          cache-dependency-path: mine-query-web/pnpm-lock.yaml
+      - working-directory: mine-query-web
+        run: pnpm install --frozen-lockfile
+      - name: Validate frontend models against backend OpenAPI
+        working-directory: mine-query-web
+        env:
+          MINEQUERY_OPENAPI_DOCUMENT: ${{ github.workspace }}/mine-query/build/openapi/mine-query-openapi.json
+        run: pnpm test:api-contract:openapi
+  frontend:
+    name: Frontend / Check and build
+    needs: [validate]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      NODE_OPTIONS: '--max-old-space-size=4096'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9.15.1'
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          cache-dependency-path: mine-query-web/pnpm-lock.yaml
+      - working-directory: mine-query-web
+        run: pnpm install --frozen-lockfile
+      - working-directory: mine-query-web
+        run: pnpm lint
+      - working-directory: mine-query-web
+        run: pnpm test
+      - name: Build and cache frontend artifact
+        run: bash ./scripts/ci/build-cache.sh ensure-frontend
+  policy:
+    name: PR / Policy
+    needs: [validate]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - run: node --test scripts/ci/*.test.mjs
+      - name: Validate private PR metadata
+        if: needs.validate.outputs.pr_number != ''
+        env:
+          PRIVATE_REPOSITORY: ${{ needs.validate.outputs.repository }}
+          PRIVATE_PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
+          PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+        run: |
+          set -eu
+          event_file="$RUNNER_TEMP/private-pr-event.json"
+          jq -n --argjson number "$PRIVATE_PR_NUMBER" '{pull_request: {number: $number}}' > "$event_file"
+          GITHUB_REPOSITORY="$PRIVATE_REPOSITORY" GITHUB_EVENT_PATH="$event_file" \
+            GITHUB_TOKEN="$PRIVATE_TOKEN" node scripts/ci/validate-pr.mjs
+  e2e:
+    name: E2E / Chromium real stack
+    needs: [validate, backend, frontend]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 40
+    env:
+      MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
+      MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
+      MAVEN_RELEASE_REPOSITORY_URL: ${{ secrets.MAVEN_RELEASE_REPOSITORY_URL }}
+      MAVEN_SNAPSHOT_REPOSITORY_URL: ${{ secrets.MAVEN_SNAPSHOT_REPOSITORY_URL }}
+      POSTGRES_PASSWORD: compose-ci-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+      - name: Require private Maven secrets
+        shell: bash
+        run: |
+          for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9.15.1'
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          cache-dependency-path: mine-query-web/pnpm-lock.yaml
+      - working-directory: mine-query-web
+        run: pnpm install --frozen-lockfile
+      - name: Install Chromium
+        working-directory: mine-query-web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Build Compose and run the repeated real-stack journey
+        run: make e2e
+      - name: Upload chromium-real-stack-failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-real-stack-failure
+          path: |
+            artifacts/e2e
+            mine-query-web/test-results/e2e
+            mine-query-web/playwright-report/e2e
+            mine-query-web/test-results/bdd
+            mine-query-web/playwright-report/bdd
+          if-no-files-found: warn
+  visual:
+    name: UI / Visual regression
+    needs: [validate, frontend]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 35
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      NODE_OPTIONS: '--max-old-space-size=4096'
+      APP_ENV: 'test'
+      AUTH_COOKIE_SECURE: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9.15.1'
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          cache-dependency-path: mine-query-web/pnpm-lock.yaml
+      - working-directory: mine-query-web
+        run: pnpm install --frozen-lockfile
+      - name: Restore or build frontend artifact from cache
+        run: bash ./scripts/ci/build-cache.sh ensure-frontend
+      - working-directory: mine-query-web
+        run: pnpm exec playwright install --with-deps chromium
+      - working-directory: mine-query-web
+        run: pnpm test:ui:visual
+      - name: Frontend interaction regression
+        working-directory: mine-query-web
+        run: pnpm test:ui:interaction --workers=1
+        timeout-minutes: 25
+      - name: Upload visual-regression-failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-failure
+          path: |
+            mine-query-web/test-results
+            mine-query-web/playwright-report
+          if-no-files-found: warn
+  accessibility:
+    name: UI / Accessibility
+    needs: [validate, frontend]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 35
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      NODE_OPTIONS: '--max-old-space-size=4096'
+      APP_ENV: 'test'
+      AUTH_COOKIE_SECURE: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v4
+        with:
+          version: '9.15.1'
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
+          cache-dependency-path: mine-query-web/pnpm-lock.yaml
+      - working-directory: mine-query-web
+        run: pnpm install --frozen-lockfile
+      - name: Restore or build frontend artifact from cache
+        run: bash ./scripts/ci/build-cache.sh ensure-frontend
+      - working-directory: mine-query-web
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Accessibility regression
+        working-directory: mine-query-web
+        run: pnpm test:ui:a11y --workers=1
+        timeout-minutes: 25
+      - name: Upload accessibility-failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: accessibility-failure
+          path: |
+            mine-query-web/test-results
+            mine-query-web/playwright-report
+          if-no-files-found: warn
+  required:
+    name: CI / Required
+    if: always()
+    needs: [validate, backend, backend-infrastructure, api-contract, frontend, policy, e2e, visual, accessibility]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All jobs must succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$JOB_RESULTS" | jq -e 'all(.[]; .result == "success")' >/dev/null
