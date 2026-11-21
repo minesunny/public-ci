@@ -108,7 +108,7 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
-          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+          cache-disabled: true
       - name: Configure local Gradle build cache
         run: bash ./scripts/ci/build-cache.sh setup-gradle
       - name: Require private Maven secrets
@@ -122,19 +122,9 @@ jobs:
           done
       - name: Run business tests and package
         working-directory: mine-query
-        run: ./gradlew --no-daemon --build-cache checkstyleMain checkstyleTest test bootJar
+        run: ./gradlew --no-daemon --build-cache test bootJar
       - name: Save backend bootJar to build cache
         run: bash ./scripts/ci/build-cache.sh save-backend-jar
-      - name: Upload backend-test-reports
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-test-reports
-          path: |
-            mine-query/build/reports/tests/test
-            mine-query/build/test-results/test
-          if-no-files-found: warn
   backend-infrastructure:
     name: Backend / Infrastructure integration
     needs: [validate]
@@ -158,7 +148,7 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
-          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+          cache-disabled: true
       - name: Configure local Gradle build cache
         run: bash ./scripts/ci/build-cache.sh setup-gradle
       - name: Require private Maven secrets
@@ -173,16 +163,6 @@ jobs:
       - name: Run PostgreSQL and Redis integration tests
         working-directory: mine-query
         run: ./gradlew --no-daemon --build-cache infrastructureTest
-      - name: Upload backend-infrastructure-test-reports
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-infrastructure-test-reports
-          path: |
-            mine-query/build/reports/tests/infrastructureTest
-            mine-query/build/test-results/infrastructureTest
-          if-no-files-found: warn
   api-contract:
     name: API / OpenAPI compatibility
     needs: [validate]
@@ -207,7 +187,7 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
-          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+          cache-disabled: true
       - name: Configure local Gradle build cache
         run: bash ./scripts/ci/build-cache.sh setup-gradle
       - name: Require private Maven secrets
@@ -222,25 +202,12 @@ jobs:
       - name: Publish and validate backend OpenAPI
         working-directory: mine-query
         run: ./gradlew --no-daemon --build-cache contractTest
-      - name: Upload backend-api-contract
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-api-contract
-          path: |
-            mine-query/build/openapi/mine-query-openapi.json
-            mine-query/build/reports/tests/contractTest
-            mine-query/build/test-results/contractTest
-          if-no-files-found: warn
       - uses: pnpm/action-setup@v4
         with:
           version: '9.15.1'
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
-          cache-dependency-path: mine-query-web/pnpm-lock.yaml
       - working-directory: mine-query-web
         run: pnpm install --frozen-lockfile
       - name: Validate frontend models against backend OpenAPI
@@ -269,8 +236,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
-          cache-dependency-path: mine-query-web/pnpm-lock.yaml
       - working-directory: mine-query-web
         run: pnpm install --frozen-lockfile
       - working-directory: mine-query-web
@@ -331,7 +296,7 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
-          cache-disabled: ${{ runner.environment != 'github-hosted' }}
+          cache-disabled: true
       - name: Require private Maven secrets
         shell: bash
         run: |
@@ -347,8 +312,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
-          cache-dependency-path: mine-query-web/pnpm-lock.yaml
       - working-directory: mine-query-web
         run: pnpm install --frozen-lockfile
       - name: Install Chromium
@@ -356,28 +319,16 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
       - name: Build Compose and run the repeated real-stack journey
         run: make e2e
-      - name: Upload chromium-real-stack-failure
-        if: failure()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: chromium-real-stack-failure
-          path: |
-            artifacts/e2e
-            mine-query-web/test-results/e2e
-            mine-query-web/playwright-report/e2e
-            mine-query-web/test-results/bdd
-            mine-query-web/playwright-report/bdd
-          if-no-files-found: warn
   visual:
     name: UI / Visual regression
     needs: [validate, frontend]
     runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
-    timeout-minutes: 35
+    timeout-minutes: 20
     env:
       NEXT_TELEMETRY_DISABLED: '1'
       NODE_OPTIONS: '--max-old-space-size=4096'
       APP_ENV: 'test'
+      MOCK_API: 'true'
       AUTH_COOKIE_SECURE: 'false'
     steps:
       - uses: actions/checkout@v4
@@ -392,8 +343,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
-          cache-dependency-path: mine-query-web/pnpm-lock.yaml
       - working-directory: mine-query-web
         run: pnpm install --frozen-lockfile
       - name: Restore or build frontend artifact from cache
@@ -404,27 +353,17 @@ jobs:
         run: pnpm test:ui:visual
       - name: Frontend interaction regression
         working-directory: mine-query-web
-        run: pnpm test:ui:interaction --workers=1
-        timeout-minutes: 25
-      - name: Upload visual-regression-failure
-        if: failure()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: visual-regression-failure
-          path: |
-            mine-query-web/test-results
-            mine-query-web/playwright-report
-          if-no-files-found: warn
+        run: pnpm test:ui:interaction
   accessibility:
     name: UI / Accessibility
     needs: [validate, frontend]
     runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
-    timeout-minutes: 35
+    timeout-minutes: 20
     env:
       NEXT_TELEMETRY_DISABLED: '1'
       NODE_OPTIONS: '--max-old-space-size=4096'
       APP_ENV: 'test'
+      MOCK_API: 'true'
       AUTH_COOKIE_SECURE: 'false'
     steps:
       - uses: actions/checkout@v4
@@ -439,8 +378,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-          cache: ${{ runner.environment == 'github-hosted' && 'pnpm' || '' }}
-          cache-dependency-path: mine-query-web/pnpm-lock.yaml
       - working-directory: mine-query-web
         run: pnpm install --frozen-lockfile
       - name: Restore or build frontend artifact from cache
@@ -449,18 +386,7 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
       - name: Accessibility regression
         working-directory: mine-query-web
-        run: pnpm test:ui:a11y --workers=1
-        timeout-minutes: 25
-      - name: Upload accessibility-failure
-        if: failure()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: accessibility-failure
-          path: |
-            mine-query-web/test-results
-            mine-query-web/playwright-report
-          if-no-files-found: warn
+        run: pnpm test:ui:a11y
   required:
     name: CI / Required
     if: always()

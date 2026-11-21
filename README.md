@@ -27,7 +27,7 @@ Select **Actions → Private PR CI → Run workflow**. Enter at most one of a fu
 
 For PR-number runs, the policy job supplies a synthesized PR event to the private repository script and validates live PR metadata; branch and commit runs skip PR metadata validation. Public workflow results are not automatically reported as checks on the private repository; implement status reporting and update the private branch ruleset before relying on this migration. Keep the original private CI enabled until these integrations have been tested.
 
-The migrated jobs upload test and failure artifacts, which may expose private source or test data. Public Actions logs are visible to others. PR code can read Maven credentials and checked-out source, so only run trusted revisions and use restricted credentials. Review artifacts, logs, caches and runner access before enabling this workflow.
+The workflow does not upload test reports or build artifacts and disables GitHub Actions dependency caches. On GitHub-hosted runners, jobs use separate temporary machines, so the private build scripts may rebuild outputs in each job. Public Actions logs are visible to others. PR code can read Maven credentials and checked-out source, so only run trusted revisions and use restricted credentials. Self-hosted runners can retain local files and caches after jobs finish; use an ephemeral runner or explicitly clean its storage. Existing artifacts and caches from previous runs are not removed by this change.
 
 ## External pull requests
 
