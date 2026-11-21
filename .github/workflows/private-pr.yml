@@ -45,7 +45,11 @@ jobs:
           [[ "$ALLOWED_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
           repository="$ALLOWED_REPOSITORY"
           pr_number=''
-          if [[ "$EVENT_NAME" == push ]]; then
+          if [[ "$EVENT_NAME" == push && "$PUSH_BRANCH" == codex/graalvm ]]; then
+            [[ "$repository" == minesunny/mine-query ]]
+            pr_number=142
+            sha=$(gh api "repos/$repository/pulls/$pr_number" --jq '.head.sha')
+          elif [[ "$EVENT_NAME" == push ]]; then
             repo_name="${repository#*/}"
             prefix="$repo_name/"
             if [[ "$PUSH_BRANCH" != "$prefix"* || "$PUSH_BRANCH" == "$prefix" ]]; then
@@ -125,6 +129,88 @@ jobs:
         run: ./gradlew --no-daemon --build-cache test bootJar
       - name: Save backend bootJar to build cache
         run: bash ./scripts/ci/build-cache.sh save-backend-jar
+  backend-native:
+    name: Backend / GraalVM Native Image
+    needs: [validate]
+    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: minequery
+          POSTGRES_USER: minequery
+          POSTGRES_PASSWORD: minequery-dev-only
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U minequery -d minequery"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '21.0.2'
+          distribution: graalvm-community
+          github-token: ${{ github.token }}
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: '9.4.0'
+          cache-disabled: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Add swap for Native Image compilation
+        if: runner.environment == 'github-hosted'
+        run: |
+          swapfile="$RUNNER_TEMP/mine-query-native.swap"
+          sudo fallocate -l 6G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
+      - name: Build Linux Native Image
+        working-directory: mine-query
+        env:
+          GRAALVM_QUICK_BUILD: 'true'
+          MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
+          MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
+          MAVEN_RELEASE_REPOSITORY_URL: ${{ secrets.MAVEN_RELEASE_REPOSITORY_URL }}
+          MAVEN_SNAPSHOT_REPOSITORY_URL: ${{ secrets.MAVEN_SNAPSHOT_REPOSITORY_URL }}
+        run: gradle --no-daemon --build-cache -PnativeProfile=compose nativeCompile --jvm-args-native=-Xmx7g
+      - name: Run the native backend and query both bundled drivers
+        working-directory: mine-query
+        env:
+          SPRING_PROFILES_ACTIVE: compose
+          DB_URL: jdbc:postgresql://127.0.0.1:${{ job.services.postgres.ports[5432] }}/minequery
+          POSTGRES_TEST_PORT: ${{ job.services.postgres.ports[5432] }}
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: ${{ job.services.redis.ports[6379] }}
+          SERVER_ADDRESS: 127.0.0.1
+          SERVER_PORT: '38082'
+          MINE_QUERY_FILE_PATH: ${{ runner.temp }}/mine-query-native-files
+        run: |
+          executable=./build/native/nativeCompile/mine-query
+          file "$executable" | grep -E 'ELF .*executable'
+          "$executable" > "$RUNNER_TEMP/mine-query-native.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+          if ! node ../scripts/ci/native-smoke.mjs; then
+            tail -n 150 "$RUNNER_TEMP/mine-query-native.log"
+            exit 1
+          fi
+
   backend-infrastructure:
     name: Backend / Infrastructure integration
     needs: [validate]
@@ -390,7 +476,7 @@ jobs:
   required:
     name: CI / Required
     if: always()
-    needs: [validate, backend, backend-infrastructure, api-contract, frontend, policy, e2e, visual, accessibility]
+    needs: [validate, backend, backend-native, backend-infrastructure, api-contract, frontend, policy, e2e, visual, accessibility]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

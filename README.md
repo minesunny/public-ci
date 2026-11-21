@@ -9,6 +9,10 @@ The public workflow runs when a matching public branch is pushed or when manuall
 3. Configure `MAVEN_REPOSITORY_USERNAME`, `MAVEN_REPOSITORY_PASSWORD`, `MAVEN_RELEASE_REPOSITORY_URL`, and `MAVEN_SNAPSHOT_REPOSITORY_URL` as Actions secrets. Optionally set the `RUNNER_TYPE` Actions variable.
 4. Commit the workflow on the default branch and include it in each public branch used to trigger a push. GitHub runs the workflow version from the pushed branch. Only trusted users should have permission to push or change workflow files.
 
+## GraalVM PR test
+
+On the `codex/graalvm` public branch, a push resolves PR 142 from `minesunny/mine-query` and checks out its current head SHA. This branch adds the PR's GraalVM Native Image build and PostgreSQL/Redis smoke test. The job participates in `CI / Required`; it does not upload artifacts or use GitHub Actions caches.
+
 ## Push trigger
 
 If the configured private repository is `minesunny/mine-query`:
