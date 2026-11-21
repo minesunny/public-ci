@@ -51,9 +51,17 @@ jobs:
             sha=$(gh api "repos/$repository/pulls/$pr_number" --jq '.head.sha')
           elif [[ "$EVENT_NAME" == push ]]; then
             repo_name="${repository#*/}"
-            prefix="$repo_name/"
-            if [[ "$PUSH_BRANCH" != "$prefix"* || "$PUSH_BRANCH" == "$prefix" ]]; then
-              echo '::error::Public branch must start with the configured private repository name followed by /.'
+            alias_name="${repo_name//-/}"
+            if [[ "$PUSH_BRANCH" == "$repo_name/"* ]]; then
+              prefix="$repo_name/"
+            elif [[ "$PUSH_BRANCH" == "$alias_name/"* ]]; then
+              prefix="$alias_name/"
+            else
+              echo "::error::Public branch must begin with $repo_name/ or $alias_name/."
+              exit 1
+            fi
+            if [[ "$PUSH_BRANCH" == "$prefix" ]]; then
+              echo '::error::Private branch or PR number must be provided.'
               exit 1
             fi
             target="${PUSH_BRANCH#"$prefix"}"

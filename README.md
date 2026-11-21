@@ -21,7 +21,7 @@ If the configured private repository is `minesunny/mine-query`:
 - Push public branch `mine-query/feature/test` to test private branch `feature/test`.
 - Push public branch `mine-query/pr/123` to test the current head of private PR 123. The `pr/` prefix is reserved for PR numbers; use manual dispatch to test a private branch with that prefix.
 
-The prefix must exactly match the configured private repository name, including case. A push to another slash-containing public branch starts a run but fails validation. Creating or updating a private PR alone does not trigger this workflow: a public branch must be pushed again. The resolved private SHA is taken at public push processing time, not the time of a private commit.
+The prefix must match the configured private repository name, including case; the hyphen-free alias is also accepted (for example, `minequery/codex/permission-workflow`). A push to another slash-containing public branch starts a run but fails validation. Creating or updating a private PR alone does not trigger this workflow: a public branch must be pushed again. The resolved private SHA is taken at public push processing time, not the time of a private commit.
 
 ## Manual runs
 
