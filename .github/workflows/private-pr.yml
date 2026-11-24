@@ -1,26 +1,24 @@
 name: Private PR CI
 on:
-  push:
-    branches:
-      - "**/**"
   workflow_dispatch:
     inputs:
       commit:
-        description: Commit SHA (40 hexadecimal characters)
+        description: Exact commit SHA, optionally paired with a PR number
         required: false
         type: string
       pr_number:
-        description: Private repository PR number
+        description: Same-repository pull request number
         required: false
         type: string
       branch:
-        description: Private repository branch name (defaults to main)
+        description: Private branch name (defaults to main)
         required: false
         type: string
 permissions: {}
+# Keep build results within the ephemeral runner. Public logs expose step status only.
 concurrency:
-  group: private-ci-${{ github.event_name == 'push' && github.ref || github.run_id }}
-  cancel-in-progress: true
+  group: hosted-private-ci-${{ github.run_id }}
+  cancel-in-progress: false
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -29,67 +27,57 @@ jobs:
       sha: ${{ steps.resolve.outputs.sha }}
       pr_number: ${{ steps.resolve.outputs.pr_number }}
     steps:
-      - name: Resolve and validate private repository revision
+      - name: Resolve trusted private revision
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
-          ALLOWED_REPOSITORY: ${{ vars.PRIVATE_REPOSITORY }}
-          EVENT_NAME: ${{ github.event_name }}
-          PUSH_BRANCH: ${{ github.ref_name }}
-          INPUT_COMMIT: ${{ inputs.commit }}
-          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
-          INPUT_BRANCH: ${{ inputs.branch }}
+          REPOSITORY: ${{ vars.PRIVATE_REPOSITORY }}
+          COMMIT: ${{ inputs.commit }}
+          PR: ${{ inputs.pr_number }}
+          BRANCH: ${{ inputs.branch }}
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$ALLOWED_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
-          repository="$ALLOWED_REPOSITORY"
-          pr_number=''
-          if [[ "$EVENT_NAME" == push ]]; then
-            repo_name="${repository#*/}"
-            prefix="$repo_name/"
-            if [[ "$PUSH_BRANCH" != "$prefix"* || "$PUSH_BRANCH" == "$prefix" ]]; then
-              echo '::error::Public branch must start with the configured private repository name followed by /.'
+          [[ "$REPOSITORY" =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]] || { echo '::error::Invalid revision input.'; exit 1; }
+          [[ -z "$COMMIT" || "$COMMIT" =~ ^[a-fA-F0-9]{40}$ ]] || { echo '::error::Invalid revision input.'; exit 1; }
+          [[ -z "$PR" || "$PR" =~ ^[1-9][0-9]*$ ]] || { echo '::error::Invalid revision input.'; exit 1; }
+          [[ -z "$BRANCH" || ( -z "$PR" && -z "$COMMIT" ) ]] || { echo '::error::Invalid revision input.'; exit 1; }
+          COMMIT=$(printf '%s' "$COMMIT" | tr 'A-F' 'a-f')
+          api="repos/$REPOSITORY"
+          if [[ -n "$PR" ]]; then
+            pr_json=$(gh api "$api/pulls/$PR")
+            sha=$(jq -er --arg repo "$REPOSITORY" '
+              select(.state == "open" and .base.repo.full_name == $repo and .head.repo.full_name == $repo)
+              | .head.sha' <<<"$pr_json")
+            if [[ -n "$COMMIT" && "$COMMIT" != "$sha" ]]; then
+              echo "::error::The PR head has changed."
               exit 1
             fi
-            target="${PUSH_BRANCH#"$prefix"}"
-            if [[ "$target" == pr/* ]]; then
-              pr_number="${target#pr/}"
-              [[ "$pr_number" =~ ^[1-9][0-9]*$ ]]
-              sha=$(gh api "repos/$repository/pulls/$pr_number" --jq '.head.sha')
-            else
-              encoded_branch=$(jq -nr --arg branch "$target" '$branch | @uri')
-              sha=$(gh api "repos/$repository/branches/$encoded_branch" --jq '.commit.sha')
+          elif [[ -n "$COMMIT" ]]; then
+            sha=$COMMIT
+            # An arbitrary fork commit may share the repository object database.
+            # Accept a main ancestor or a current head of a private repository branch.
+            ancestor=$(gh api "$api/compare/$sha...main" --jq '.merge_base_commit.sha')
+            if [[ "$ancestor" != "$sha" ]]; then
+              gh api "$api/commits/$sha/branches-where-head" | jq -e 'length > 0' >/dev/null
             fi
           else
-            count=0
-            [[ -z "$INPUT_COMMIT" ]] || count=$((count + 1))
-            [[ -z "$INPUT_PR_NUMBER" ]] || count=$((count + 1))
-            [[ -z "$INPUT_BRANCH" ]] || count=$((count + 1))
-            if (( count > 1 )); then
-              echo '::error::Specify only one of commit, PR number, or branch.'
-              exit 1
-            fi
-            if [[ -n "$INPUT_PR_NUMBER" ]]; then
-              [[ "$INPUT_PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
-              pr_number="$INPUT_PR_NUMBER"
-              sha=$(gh api "repos/$repository/pulls/$pr_number" --jq '.head.sha')
-            elif [[ -n "$INPUT_COMMIT" ]]; then
-              [[ "$INPUT_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]
-              sha="${INPUT_COMMIT,,}"
-            else
-              branch="${INPUT_BRANCH:-main}"
-              encoded_branch=$(jq -nr --arg branch "$branch" '$branch | @uri')
-              sha=$(gh api "repos/$repository/branches/$encoded_branch" --jq '.commit.sha')
-            fi
+            branch=${BRANCH:-main}
+            git check-ref-format --branch "$branch" >/dev/null
+            encoded=$(jq -nr --arg branch "$branch" '$branch | @uri')
+            sha=$(gh api "$api/branches/$encoded" --jq '.commit.sha')
           fi
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
-          printf 'repository=%s\nsha=%s\npr_number=%s\n' "$repository" "$sha" "$pr_number" >> "$GITHUB_OUTPUT"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Invalid revision input.'; exit 1; }
+          printf 'repository=%s\nsha=%s\npr_number=%s\n' "$REPOSITORY" "$sha" "$PR" >> "$GITHUB_OUTPUT"
+
   backend:
     name: Backend / Test and build
     needs: [validate]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: mine-query
     env:
       MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
       MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
@@ -108,12 +96,16 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
+          gradle-version: '9.4.0'
           cache-disabled: true
-      - name: Configure local Gradle build cache
-        run: bash ./scripts/ci/build-cache.sh setup-gradle
+          add-job-summary: never
+          add-job-summary-as-pr-comment: never
+          dependency-graph: disabled
+          build-scan-publish: false
       - name: Require private Maven secrets
         shell: bash
         run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
           for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
             if [ -z "${!name}" ]; then
               echo "::error::Missing repository secret: $name"
@@ -121,15 +113,153 @@ jobs:
             fi
           done
       - name: Run business tests and package
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          gradle --no-daemon --no-build-cache checkstyleMain checkstyleTest test bootJar
+      - &failure-summary
+        name: Show sanitized failure category and test totals
+        if: failure()
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os, re
+          from pathlib import Path
+          from xml.etree import ElementTree as XML
+          temp = Path(os.environ['RUNNER_TEMP'])
+          root = Path(os.environ['GITHUB_WORKSPACE'])
+          log = temp / ('private-' + os.environ['GITHUB_JOB'] + '.log')
+          if log.is_file():
+              with log.open('rb') as stream:
+                  stream.seek(max(0, log.stat().st_size - 4_000_000))
+                  text = stream.read().decode(errors='replace')
+              patterns = {
+                  'dependency or repository': r'Could not resolve|Could not (?:GET|HEAD)|ERR_PNPM_FETCH|unable to fetch|PKIX path',
+                  'compilation or type check': r'Compilation failed|Failed to compile|error: cannot find symbol|Type error:',
+                  'style check': r'Checkstyle rule violations|ESLint found|checkstyle(?:Main|Test) FAILED',
+                  'tests': r'There were failing tests|tests? failed|[0-9]+ failed|AssertionError|Tests run:.*Failures: [1-9]',
+                  'container or service startup': r'unhealthy|did not start|failed to start|container.*exited|health check failed',
+                  'timeout': r'TimeoutError|[Tt]imed? ?out|budget exceeded',
+                  'runner resource limit': r'OutOfMemoryError|No space left on device|Killed process|exit code 137',
+              }
+              for name, pattern in patterns.items():
+                  if re.search(pattern, text, re.I):
+                      print('Failure category:', name)
+              for task in ('compileJava','compileTestJava','checkstyleMain','checkstyleTest','test','contractTest','infrastructureTest','bootJar','nativeCompile'):
+                  if re.search(r'^> Task :' + task + r' FAILED$', text, re.M):
+                      print('Failed Gradle task:', task)
+              for state, count in ((m[2], int(m[1])) for m in re.finditer(r'^\s*(\d{1,7}) (passed|failed|skipped)\b', text, re.M)):
+                  print('Test count:', state, count)
+          totals = [0] * 4
+          for report in (root/'mine-query/build/test-results').glob('*/TEST-*.xml'):
+              try:
+                  suite = next(XML.iterparse(report.open('rb'), events=('start',)))[1]
+                  counts = [int(suite.get(k,'0')) for k in ('tests','failures','errors','skipped')]
+                  totals = [a + b for a,b in zip(totals,counts)]
+              except (OSError, XML.ParseError, ValueError, StopIteration):
+                  continue
+          if any(totals):
+              print('JUnit totals (tests, failures, errors, skipped):', *totals)
+          PYTHON
+
+  backend-native:
+    name: Backend / GraalVM Native Image
+    needs: [validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: minequery
+          POSTGRES_USER: minequery
+          POSTGRES_PASSWORD: minequery-dev-only
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U minequery -d minequery"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ needs.validate.outputs.repository }}
+          ref: ${{ needs.validate.outputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
+          persist-credentials: false
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '21.0.2'
+          distribution: graalvm-community
+          github-token: ${{ github.token }}
+          native-image-job-reports: 'false'
+          native-image-pr-reports: 'false'
+          native-image-enable-sbom: 'false'
+      - uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: '9.4.0'
+          cache-disabled: true
+          add-job-summary: never
+          add-job-summary-as-pr-comment: never
+          dependency-graph: disabled
+          build-scan-publish: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Add swap for Native Image compilation
+        if: runner.environment == 'github-hosted'
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          swapfile="$RUNNER_TEMP/mine-query-native.swap"
+          sudo fallocate -l 6G "$swapfile"
+          sudo chmod 600 "$swapfile"
+          sudo mkswap "$swapfile"
+          sudo swapon "$swapfile"
+      - name: Build Linux Native Image
         working-directory: mine-query
-        run: ./gradlew --no-daemon --build-cache test bootJar
-      - name: Save backend bootJar to build cache
-        run: bash ./scripts/ci/build-cache.sh save-backend-jar
+        env:
+          GRAALVM_QUICK_BUILD: 'true'
+          MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
+          MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
+          MAVEN_RELEASE_REPOSITORY_URL: ${{ secrets.MAVEN_RELEASE_REPOSITORY_URL }}
+          MAVEN_SNAPSHOT_REPOSITORY_URL: ${{ secrets.MAVEN_SNAPSHOT_REPOSITORY_URL }}
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          gradle --no-daemon --no-build-cache -PnativeProfile=compose nativeCompile --jvm-args-native=-Xmx7g
+      - name: Run the native backend and query both bundled drivers
+        working-directory: mine-query
+        env:
+          SPRING_PROFILES_ACTIVE: compose
+          DB_URL: jdbc:postgresql://127.0.0.1:${{ job.services.postgres.ports['5432'] }}/minequery
+          POSTGRES_TEST_PORT: ${{ job.services.postgres.ports['5432'] }}
+          REDIS_HOST: 127.0.0.1
+          REDIS_PORT: ${{ job.services.redis.ports['6379'] }}
+          SERVER_ADDRESS: 127.0.0.1
+          SERVER_PORT: '38082'
+          MINE_QUERY_FILE_PATH: ${{ runner.temp }}/mine-query-native-files
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          executable=./build/native/nativeCompile/mine-query
+          file "$executable" | grep -E 'ELF .*executable'
+          "$executable" > "$RUNNER_TEMP/mine-query-native.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+          node ../scripts/ci/native-smoke.mjs
+      - *failure-summary
+
   backend-infrastructure:
     name: Backend / Infrastructure integration
     needs: [validate]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: mine-query
     env:
       MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
       MAVEN_REPOSITORY_PASSWORD: ${{ secrets.MAVEN_REPOSITORY_PASSWORD }}
@@ -148,12 +278,16 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
+          gradle-version: '9.4.0'
           cache-disabled: true
-      - name: Configure local Gradle build cache
-        run: bash ./scripts/ci/build-cache.sh setup-gradle
+          add-job-summary: never
+          add-job-summary-as-pr-comment: never
+          dependency-graph: disabled
+          build-scan-publish: false
       - name: Require private Maven secrets
         shell: bash
         run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
           for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
             if [ -z "${!name}" ]; then
               echo "::error::Missing repository secret: $name"
@@ -161,12 +295,15 @@ jobs:
             fi
           done
       - name: Run PostgreSQL and Redis integration tests
-        working-directory: mine-query
-        run: ./gradlew --no-daemon --build-cache infrastructureTest
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          gradle --no-daemon --no-build-cache infrastructureTest
+      - *failure-summary
+
   api-contract:
     name: API / OpenAPI compatibility
     needs: [validate]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
       MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
@@ -187,12 +324,17 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
+          gradle-version: '9.4.0'
           cache-disabled: true
-      - name: Configure local Gradle build cache
-        run: bash ./scripts/ci/build-cache.sh setup-gradle
+          add-job-summary: never
+          add-job-summary-as-pr-comment: never
+          dependency-graph: disabled
+          build-scan-publish: false
       - name: Require private Maven secrets
         shell: bash
+        working-directory: mine-query
         run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
           for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
             if [ -z "${!name}" ]; then
               echo "::error::Missing repository secret: $name"
@@ -201,7 +343,9 @@ jobs:
           done
       - name: Publish and validate backend OpenAPI
         working-directory: mine-query
-        run: ./gradlew --no-daemon --build-cache contractTest
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          gradle --no-daemon --no-build-cache contractTest
       - uses: pnpm/action-setup@v4
         with:
           version: '9.15.1'
@@ -209,17 +353,26 @@ jobs:
         with:
           node-version-file: .nvmrc
       - working-directory: mine-query-web
-        run: pnpm install --frozen-lockfile
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm install --frozen-lockfile
       - name: Validate frontend models against backend OpenAPI
         working-directory: mine-query-web
         env:
           MINEQUERY_OPENAPI_DOCUMENT: ${{ github.workspace }}/mine-query/build/openapi/mine-query-openapi.json
-        run: pnpm test:api-contract:openapi
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm test:api-contract:openapi
+      - *failure-summary
+
   frontend:
     name: Frontend / Check and build
     needs: [validate]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: mine-query-web
     env:
       NEXT_TELEMETRY_DISABLED: '1'
       NODE_OPTIONS: '--max-old-space-size=4096'
@@ -236,18 +389,26 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-      - working-directory: mine-query-web
-        run: pnpm install --frozen-lockfile
-      - working-directory: mine-query-web
-        run: pnpm lint
-      - working-directory: mine-query-web
-        run: pnpm test
-      - name: Build and cache frontend artifact
-        run: bash ./scripts/ci/build-cache.sh ensure-frontend
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm install --frozen-lockfile
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm lint
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm test
+      - name: Build frontend
+        working-directory: ${{ github.workspace }}
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm --dir mine-query-web build
+      - *failure-summary
+
   policy:
     name: PR / Policy
     needs: [validate]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -259,23 +420,31 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-      - run: node --test scripts/ci/*.test.mjs
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          node --test scripts/ci/*.test.mjs
       - name: Validate private PR metadata
         if: needs.validate.outputs.pr_number != ''
         env:
           PRIVATE_REPOSITORY: ${{ needs.validate.outputs.repository }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
           PRIVATE_PR_NUMBER: ${{ needs.validate.outputs.pr_number }}
           PRIVATE_TOKEN: ${{ secrets.PRIVATE_REPO_READ_TOKEN }}
         run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
           set -eu
+          head=$(GH_TOKEN="$PRIVATE_TOKEN" gh api "repos/$PRIVATE_REPOSITORY/pulls/$PRIVATE_PR_NUMBER" --jq '.head.sha')
+          [[ "$head" == "$EXPECTED_SHA" ]] || { echo '::error::Invalid revision input.'; exit 1; }
           event_file="$RUNNER_TEMP/private-pr-event.json"
           jq -n --argjson number "$PRIVATE_PR_NUMBER" '{pull_request: {number: $number}}' > "$event_file"
           GITHUB_REPOSITORY="$PRIVATE_REPOSITORY" GITHUB_EVENT_PATH="$event_file" \
             GITHUB_TOKEN="$PRIVATE_TOKEN" node scripts/ci/validate-pr.mjs
+      - *failure-summary
+
   e2e:
     name: E2E / Chromium real stack
     needs: [validate, backend, frontend]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       MAVEN_REPOSITORY_USERNAME: ${{ secrets.MAVEN_REPOSITORY_USERNAME }}
@@ -296,10 +465,16 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v5
         with:
+          gradle-version: '9.4.0'
           cache-disabled: true
+          add-job-summary: never
+          add-job-summary-as-pr-comment: never
+          dependency-graph: disabled
+          build-scan-publish: false
       - name: Require private Maven secrets
         shell: bash
         run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
           for name in MAVEN_REPOSITORY_USERNAME MAVEN_REPOSITORY_PASSWORD MAVEN_RELEASE_REPOSITORY_URL MAVEN_SNAPSHOT_REPOSITORY_URL; do
             if [ -z "${!name}" ]; then
               echo "::error::Missing repository secret: $name"
@@ -313,22 +488,35 @@ jobs:
         with:
           node-version-file: .nvmrc
       - working-directory: mine-query-web
-        run: pnpm install --frozen-lockfile
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm install --frozen-lockfile
       - name: Install Chromium
         working-directory: mine-query-web
-        run: pnpm exec playwright install --with-deps chromium
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm exec playwright install --with-deps chromium
       - name: Build Compose and run the repeated real-stack journey
-        run: make e2e
+        env:
+          MINEQUERY_CI_CACHE_DIR: ${{ runner.temp }}/local-build
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          gradle -p mine-query --no-daemon --no-build-cache bootJar -x test
+          ./scripts/run-compose-e2e.sh
+      - *failure-summary
+
   visual:
     name: UI / Visual regression
     needs: [validate, frontend]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: mine-query-web
     env:
       NEXT_TELEMETRY_DISABLED: '1'
       NODE_OPTIONS: '--max-old-space-size=4096'
       APP_ENV: 'test'
-      MOCK_API: 'true'
       AUTH_COOKIE_SECURE: 'false'
     steps:
       - uses: actions/checkout@v4
@@ -343,27 +531,39 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-      - working-directory: mine-query-web
-        run: pnpm install --frozen-lockfile
-      - name: Restore or build frontend artifact from cache
-        run: bash ./scripts/ci/build-cache.sh ensure-frontend
-      - working-directory: mine-query-web
-        run: pnpm exec playwright install --with-deps chromium
-      - working-directory: mine-query-web
-        run: pnpm test:ui:visual
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm install --frozen-lockfile
+      - name: Build frontend on this runner
+        working-directory: ${{ github.workspace }}
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm --dir mine-query-web build
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm exec playwright install --with-deps chromium
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm test:ui:visual
       - name: Frontend interaction regression
-        working-directory: mine-query-web
-        run: pnpm test:ui:interaction
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm test:ui:interaction --workers=1
+        timeout-minutes: 25
+      - *failure-summary
+
   accessibility:
     name: UI / Accessibility
     needs: [validate, frontend]
-    runs-on: ${{ vars.RUNNER_TYPE || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: mine-query-web
     env:
       NEXT_TELEMETRY_DISABLED: '1'
       NODE_OPTIONS: '--max-old-space-size=4096'
       APP_ENV: 'test'
-      MOCK_API: 'true'
       AUTH_COOKIE_SECURE: 'false'
     steps:
       - uses: actions/checkout@v4
@@ -378,19 +578,28 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
-      - working-directory: mine-query-web
-        run: pnpm install --frozen-lockfile
-      - name: Restore or build frontend artifact from cache
-        run: bash ./scripts/ci/build-cache.sh ensure-frontend
-      - working-directory: mine-query-web
-        run: pnpm exec playwright install --with-deps chromium
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm install --frozen-lockfile
+      - name: Build frontend on this runner
+        working-directory: ${{ github.workspace }}
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm --dir mine-query-web build
+      - run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm exec playwright install --with-deps chromium
       - name: Accessibility regression
-        working-directory: mine-query-web
-        run: pnpm test:ui:a11y
+        run: |
+          exec >"$RUNNER_TEMP/private-$GITHUB_JOB.log" 2>&1
+          pnpm test:ui:a11y --workers=1
+        timeout-minutes: 25
+      - *failure-summary
+
   required:
     name: CI / Required
     if: always()
-    needs: [validate, backend, backend-infrastructure, api-contract, frontend, policy, e2e, visual, accessibility]
+    needs: [validate, backend, backend-native, backend-infrastructure, api-contract, frontend, policy, e2e, visual, accessibility]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
